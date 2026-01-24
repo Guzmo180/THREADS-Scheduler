@@ -17,7 +17,7 @@ void dispatcher();
 static int launch(void *);
 static void check_deadlock();
 static void DebugConsole(char* format, ...);
-
+Process* nextProcess = NULL; 
 /* DO NOT REMOVE */
 extern int SchedulerEntryPoint(void* pArgs);
 int check_io_scheduler();
@@ -59,10 +59,12 @@ int bootstrap(void *pArgs)
         processTable[i].pid = 0; //initializing with table empty
     }
     /* Initialize the Ready list, etc. */
-    
+    Process* pProcess = nextProcess; 
 
     /* Initialize the clock interrupt handler */
-    
+    interrupt_handler_t* handlers;
+    handlers = get_interrupt_handlers();
+    handlers[THREADS_TIMER_INTERRUPT] = system_clock;
 
     /* startup a watchdog process */
     result = k_spawn("watchdog", watchdog, NULL, THREADS_MIN_STACK_SIZE, LOWEST_PRIORITY);
@@ -81,7 +83,7 @@ int bootstrap(void *pArgs)
     }
 
     /* Initialized and ready to go!! */
-    dispatcher(); // the dispatcher is ready to start running the processes 
+    
     /* This should never return since we are not a real process. */
 
     stop(-3);
@@ -152,9 +154,10 @@ int k_spawn(char* name, int (*entryPoint)(void *), void* arg, int stacksize, int
     
 
     /* Add the process to the ready list. */
-    //
+    pNewProc->nextReadyProcess = nextProcess;
+    nextProcess = pNewProc;// add to head of list
     // 
-    //pNewProc->status = ;
+    
     pNewProc->pid = nextPid++; //assign pid and increment for the next process
     pNewProc->priority = priority; //set priority of process
     pNewProc->entryPoint = entryPoint; //set entry point
