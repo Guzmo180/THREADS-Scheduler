@@ -544,7 +544,7 @@ Process* readyq_remove_pid(int pid)
         return NULL;
     }
 
-int time_slice()
+void time_slice(void)
 {
     disableInterrupts();
         if (runningProcess != NULL)
@@ -565,4 +565,5 @@ int time_slice()
     }
     return 0;
 }
+
 
