@@ -136,10 +136,52 @@ int k_spawn(char* name, int (*entryPoint)(void*), void* arg, int stacksize, int 
     }
 
 
-    /* Find an empty slot in the process table */
+   /*Testing for kernel mode*/
+ unsigned int psr = get_psr();
+ if ((psr & PSR_KERNEL_MODE) == 0)
+ {
+     console_output(debugFlag, "spawn(): Kernel mode is required. \n");
+     return -1;
+ }
 
-    proc_slot = 1;  // just use 1 for now!
-    pNewProc = &processTable[proc_slot];
+ /*entrypoint validation*/
+ if (entryPoint == NULL)
+ {
+     console_output(debugFlag, "spawn(): Entry point value is NULL.\n");
+     return -1;
+ }
+/*Checking stack size and priorities*/
+ if (stacksize < THREADS_MIN_STACK_SIZE)
+ {
+     console_output(debugFlag, "spawn():  Stack size is to small.\n");
+     return -1;
+ }
+ if (priority < LOWEST_PRIORITY || priority > HIGHEST_PRIORITY)
+ {
+     console_output(debugFlag, "spawn():  Priority value is invalid.\n");
+     return -1;
+ }
+ /* Find an empty slot in the process table */
+ 
+ proc_slot = -1;  // just use 1 for now! needs to be -1
+ int checkedSlots = 0;
+ int procSlotIndex = 0;
+ while(checkedSlots < MAXPROC)
+ {
+     if (processTable[procSlotIndex].status == STATUS_READY)
+     {
+         proc_slot = procSlotIndex;
+         break;
+     }
+     procSlotIndex = (procSlotIndex + 1) % MAXPROC;
+     checkedSlots++;
+ }
+ if (proc_slot == -1)
+ {
+     console_output(debugFlag, "spawn(): no process slots free. \n");
+     return -1;
+ }
+ pNewProc = &processTable[proc_slot];
 
     /* Setup the entry in the process table. */
     strcpy(pNewProc->name, name);
@@ -523,3 +565,4 @@ int time_slice()
     }
     return 0;
 }
+
