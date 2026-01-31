@@ -1,21 +1,24 @@
-
 #define _CRT_SECURE_NO_WARNINGS
 #define NUM_PRIORITIES 6
-
+#define MAX_PID 51
 #include <stdio.h>
 #include "THREADSLib.h"
 #include "Scheduler.h"
 #include "Processes.h"
 
+Process* readyq_pop_highest(void);
+Process* readyProcs[NUM_PRIORITIES];
 Process processTable[MAX_PROCESSES];
-Process *runningProcess = NULL;
+Process* runningProcess = NULL;
 int nextPid = 1;
 int debugFlag = 1;
 
 static int watchdog(char*);
 static inline void disableInterrupts();
+static inline void enable_interrupts();
+static int clamp_priority(int priority);
 void dispatcher();
-static int launch(void *);
+static int launch(void*);
 static void check_deadlock();
 static void DebugConsole(char* format, ...);
 
@@ -31,13 +34,13 @@ check_io_function check_io;
    Purpose - This is the first function called by THREADS on startup.
 
              The function must setup the OS scheduler and primitive
-             functionality and then spawn the first two processes.  
-             
-             The first two process are the watchdog process 
-             and the startup process SchedulerEntryPoint.  
-             
+             functionality and then spawn the first two processes.
+
+             The first two process are the watchdog process
+             and the startup process SchedulerEntryPoint.
+
              The statup process is used to initialize additional layers
-             of the OS.  It is also used for testing the scheduler 
+             of the OS.  It is also used for testing the scheduler
              functions.
 
    Parameters - Arguments *pArgs - these arguments are unused at this time.
@@ -47,7 +50,7 @@ check_io_function check_io;
    Side Effects - The effects of this function is the launching of the kernel.
 
  *************************************************************************/
-int bootstrap(void *pArgs)
+int bootstrap(void* pArgs)
 {
     int result; /* value returned by call to spawn() */
 
@@ -59,14 +62,14 @@ int bootstrap(void *pArgs)
     for (int i = 0; i < MAX_PROCESSES; i++)
     {
         processTable[i].pid = 0; // mark process table entry as empty
-    }           
+    }
 
     /* Initialize the Ready list, etc. */
-     readyProcs[0] = NULL;
+    readyProcs[0] = NULL;
     /* Initialize the clock interrupt handler */
     interrupt_handler_t* handlers;
     handlers = get_interrupt_handlers();
-    handlers[THREADS_TIMER_INTERRUPT] = system_clock;
+    //handlers[THREADS_TIMER_INTERRUPT] = time_slice;
     /* startup a watchdog process */
     result = k_spawn("watchdog", watchdog, NULL, THREADS_MIN_STACK_SIZE, LOWEST_PRIORITY);
     if (result < 0)
@@ -79,12 +82,12 @@ int bootstrap(void *pArgs)
     result = k_spawn("Scheduler", SchedulerEntryPoint, NULL, 2 * THREADS_MIN_STACK_SIZE, HIGHEST_PRIORITY);
     if (result < 0)
     {
-        console_output(debugFlag,"Scheduler(): spawn for SchedulerEntryPoint returned an error (%d), stopping...\n", result);
+        console_output(debugFlag, "Scheduler(): spawn for SchedulerEntryPoint returned an error (%d), stopping...\n", result);
         stop(1);
     }
-    enable_interrupts(result);
-    dispatcher(result)
-
+    enable_interrupts(runningProcess);
+    dispatcher(runningProcess);
+    printf("%c is result", result);
     /* Initialized and ready to go!! */
 
     /* This should never return since we are not a real process. */
@@ -98,7 +101,7 @@ int bootstrap(void *pArgs)
    k_spawn()
 
    Purpose - spawns a new process.
-   
+
              Finds an empty entry in the process table and initializes
              information of the process.  Updates information in the
              parent process to reflect this child process creation.
@@ -106,11 +109,11 @@ int bootstrap(void *pArgs)
    Parameters - the process's entry point function, the stack size, and
                 the process's priority.
 
-   Returns - The Process ID (pid) of the new child process 
+   Returns - The Process ID (pid) of the new child process
              The function must return if the process cannot be created.
 
 ************************************************************************ */
-int k_spawn(char* name, int (*entryPoint)(void *), void* arg, int stacksize, int priority)
+int k_spawn(char* name, int (*entryPoint)(void*), void* arg, int stacksize, int priority)
 {
     int proc_slot;
     struct _process* pNewProc;
@@ -128,13 +131,55 @@ int k_spawn(char* name, int (*entryPoint)(void *), void* arg, int stacksize, int
     if (strlen(name) >= (MAXNAME - 1))
     {
         console_output(debugFlag, "spawn(): Process name is too long.  Halting...\n");
-        stop( 1);
+        stop(1);
     }
 
 
+    /*Testing for kernel mode*/
+    unsigned int psr = get_psr();
+    if ((psr & PSR_KERNEL_MODE) == 0)
+    {
+        console_output(debugFlag, "spawn(): Kernel mode is required. \n");
+        return -1;
+    }
+
+    /*entrypoint validation*/
+    if (entryPoint == NULL)
+    {
+        console_output(debugFlag, "spawn(): Entry point value is NULL.\n");
+        return -1;
+    }
+    /*Checking stack size and priorities*/
+    if (stacksize < THREADS_MIN_STACK_SIZE)
+    {
+        console_output(debugFlag, "spawn():  Stack size is to small.\n");
+        return -1;
+    }
+    if (priority < LOWEST_PRIORITY || priority > HIGHEST_PRIORITY)
+    {
+        console_output(debugFlag, "spawn():  Priority value is invalid.\n");
+        return -1;
+    }
     /* Find an empty slot in the process table */
-    
-    proc_slot = 1;  // just use 1 for now!
+
+    proc_slot = -1;  // just use 1 for now! needs to be -1
+    int checkedSlots = 0;
+    int procSlotIndex = 0;
+    while (checkedSlots < MAXPROC)
+    {
+        if (processTable[procSlotIndex].status = STATUS_READY )
+        {
+            proc_slot = procSlotIndex;
+            break;
+        }
+        procSlotIndex = (procSlotIndex + 1) % MAXPROC;
+        checkedSlots++;
+    }
+    if (proc_slot == -1)
+    {
+        console_output(debugFlag, "spawn(): no process slots free. \n");
+        return -1;
+    }
     pNewProc = &processTable[proc_slot];
 
     /* Setup the entry in the process table. */
@@ -161,13 +206,13 @@ int k_spawn(char* name, int (*entryPoint)(void *), void* arg, int stacksize, int
    Name - launch
 
    Purpose - Utility function that makes sure the environment is ready,
-             such as enabling interrupts, for the new process.  
+             such as enabling interrupts, for the new process.
 
    Parameters - none
 
    Returns - nothing
 *************************************************************************/
-static int launch(void *args)
+static int launch(void* args)
 {
 
     DebugConsole("launch(): started: %s\n", runningProcess->name);
@@ -181,8 +226,9 @@ static int launch(void *args)
     DebugConsole("Process %d returned to launch\n", runningProcess->pid);
 
     /* Stop the process gracefully */
-    k_exit(result);
-} 
+    k_exit(0);
+    return 0;
+}
 
 /**************************************************************************
    Name - k_wait
@@ -190,7 +236,7 @@ static int launch(void *args)
    Purpose - Wait for a child process to quit.  Return right away if
              a child has already quit.
 
-   Parameters - Output parameter for the child's exit code. 
+   Parameters - Output parameter for the child's exit code.
 
    Returns - the pid of the quitting child, or
         -4 if the process has no children
@@ -202,18 +248,18 @@ int k_wait(int* code)
     int result = 0;
     return result;
 
-} 
+}
 
 /**************************************************************************
    Name - k_exit
 
-   Purpose - Exits a process and coordinates with the parent for cleanup 
+   Purpose - Exits a process and coordinates with the parent for cleanup
              and return of the exit code.
 
    Parameters - the code to return to the grieving parent
 
    Returns - nothing
-   
+
 *************************************************************************/
 void k_exit(int code)
 {
@@ -308,7 +354,7 @@ void display_process_table()
 *************************************************************************/
 void dispatcher()
 {
-    Process *nextProcess = NULL;
+    Process* nextProcess = NULL;
     //get the next ready process
     clamp_priority(runningProcess->priority);
     nextProcess = readyq_pop_highest();
@@ -316,15 +362,15 @@ void dispatcher()
         console_output(debugFlag, "dispatcher(): No ready process found!  Stopping...\n");
         stop(3);
     }
-    DebugConsole("dispatcher(): switching to process %s (pid %d)\n", nextProcess->name, nextProcess->pid);
-    runningProcess = nextProcess;           
+    DebugConsole("dispatcher(): switching to process %s (pid %d)\n", *nextProcess->name, nextProcess->pid);
+    runningProcess = nextProcess;
 
-   // check the runningproccess time_slice
-    time_slice(runningProcess);
+    // check the runningproccess time_slice
+    time_slice();
     context_switch(nextProcess->context);
 
-} 
- 
+}
+
 
 /**************************************************************************
    Name - watchdog
@@ -345,13 +391,13 @@ static int watchdog(char* dummy)
         check_deadlock();
     }
     return 0;
-} 
+}
 
 /* check to determine if deadlock has occurred... */
 static void check_deadlock()
 {
-    if ( (runningProcess->nextReadyProcess == NULL) &&
-         (runningProcess->pChildren == NULL) )
+    if ((runningProcess->nextReadyProcess == NULL) &&
+        (runningProcess->pChildren == NULL))
     {
         console_output(debugFlag, "Deadlock detected by watchdog process!  Stopping...\n"); // output debug message
         stop(2);// stop the system
@@ -371,7 +417,7 @@ static inline void disableInterrupts()
 
     psr = psr & ~PSR_INTERRUPTS;
 
-    set_psr( psr);
+    set_psr(psr);
 
 } /* disableInterrupts */
 static inline void enable_interrupts()
@@ -380,9 +426,9 @@ static inline void enable_interrupts()
 
     psr = psr | PSR_INTERRUPTS; // enable interrupts
 
-    set_psr( psr);
+    set_psr(psr);
 }
-    /* We ARE in kernel mode */
+/* We ARE in kernel mode */
 /**************************************************************************
    Name - DebugConsole
    Purpose - Prints  the message to the console_output if in debug mode
@@ -412,7 +458,7 @@ int check_io_scheduler()
     return false;
 }
 
-{}
+
 
 static int clamp_priority(int priority)
 {
@@ -420,114 +466,101 @@ static int clamp_priority(int priority)
     {
         return 0;
     }
-    if( priority >= NUM_PRIORITIES) 
+    if (priority >= NUM_PRIORITIES)
     {
         return NUM_PRIORITIES - 1;
-        
+
     }
-        return priority;
-    
-}
-readyProcs
-void readyq_push(Process* proc) 
-{
-if (proc == NULL) return;
-int prio = clamp_priority(proc->priority);
-proc->nextReadyProcess = NULL;
-if (readyProcs[prio] == NULL) {
-readyProcs[prio] = proc;
-return;
+    return priority;
+
 }
 
-Process* cur = readyProcs[prio];
-while (cur->nextReadyProcess != NULL) {
-cur = cur->nextReadyProcess;
-}
-cur->nextReadyProcess = proc;
+void readyq_push(Process* proc)
+{
+    if (proc == NULL) return;
+    int prio = clamp_priority(proc->priority);
+    proc->nextReadyProcess = NULL;
+    if (readyProcs[prio] == NULL) {
+        readyProcs[prio] = proc;
+        return;
+    }
+
+    Process* cur = readyProcs[prio];
+    while (cur->nextReadyProcess != NULL) {
+        cur = cur->nextReadyProcess;
+    }
+    cur->nextReadyProcess = proc;
 }
 
-Process* readyq_pop_prio(int prio) 
+Process* readyq_pop_prio(int prio)
 {
-prio = clamp_priority(prio);
-Process* head = readyProcs[prio];
-if (head == NULL) return NULL;
-readyProcs[prio] = head->nextReadyProcess;
-head->nextReadyProcess = NULL;
-return head;
+    prio = clamp_priority(prio);
+    Process* head = readyProcs[prio];
+    if (head == NULL) return NULL;
+    readyProcs[prio] = head->nextReadyProcess;
+    head->nextReadyProcess = NULL;
+    return head;
 }
 
 Process* readyq_pop_highest(void) // Pop the highest priority process
 {
-for (int prio = NUM_PRIORITIES - 1; prio >= 0; prio--) 
- {
- if (readyProcs[prio] != NULL) 
-  {
-    return readyq_pop_prio(prio);
-  }
- }
-return NULL;
-}
-
-Process* readyq_remove_pid(int pid) 
-{
- Process* target = &ProcessTable[pid % MAX_PROCESSES];
- int prio = clamp_priority(target->priority);
- Process* prev = NULL;
- Process* cur = readyProcs[prio];
- 
- while (cur != NULL) 
- {
-  if (cur == target) 
-   {
-    if (prev == NULL) 
+    for (int prio = NUM_PRIORITIES - 1; prio >= 0; prio--)
     {
-        readyProcs[prio] = cur->nextReadyProcess;
-
-    else{
-        prev->nextReadyProcess = cur->nextReadyProcess;
+        if (readyProcs[prio] != NULL)
+        {
+            return readyq_pop_prio(prio);
         }
-    cur->nextReadyProcess = NULL;
-    return cur;
     }
-    prev = cur;
-    cur = cur->nextReadyProcess;
-     }
-  return NULL;
- }
+    return NULL;
 }
-/* ---- Demo utilities ---- */
-/*
-* This function simplifies the spawn logic
-* since this demo is for list establishment
-*/
-void init_process(short pid, int prio, int status) {
-if (pid < 1 || pid >MAX_PID) return;
-ProcessTable[pid % MAX_PROCESSES].pid = pid;
-ProcessTable[pid % MAX_PROCESSES].priority = prio;
-ProcessTable[pid % MAX_PROCESSES].status = status;
-ProcessTable[pid % MAX_PROCESSES].nextReadyProcess = NULL;
+
+Process* readyq_remove_pid(int pid)
+{
+    Process* target = &processTable[pid % MAX_PROCESSES];
+    int prio = clamp_priority(target->priority);
+    Process* prev = NULL;
+    Process* cur = readyProcs[prio];
+
+    while (cur != NULL)
+    {
+        if (cur == target)
+        {
+            if (prev == NULL)
+            {
+                readyProcs[prio] = cur->nextReadyProcess;
+            }
+
+            else {
+                prev->nextReadyProcess = cur->nextReadyProcess;
+            }
+
+            cur->nextReadyProcess = NULL;
+            return cur;
+        }
+        prev = cur;
+        cur = cur->nextReadyProcess;
+    }
+    return NULL;
 }
-void print_ready_queues(void) {
-printf("=== Ready Queues ===\n");
-for (int prio = 0; prio < NUM_PRIORITIES; prio++) {
-printf("P%d: ", prio);
-Process* cur = readyProcs[prio];
-if (!cur) {
-printf("(empty)");
-}
-while (cur) {
-printf("[pid=%d st=%d] ", cur->pid, cur->status);
-cur = cur->nextReadyProcess;
-}
-printf("\n");
-}
-printf("\n");
-}
-const char* status_name(int st) {
-switch (st) {
-case READY: return "READY";
-case BLOCKED: return "BLOCKED";
-case K_EXIT: return "K_EXIT";
-default: return "UNKNOWN";
-}
+
+void time_slice(void)
+{
+    disableInterrupts();
+    if (runningProcess != NULL)
+    {
+        readyq_push(runningProcess);
+    }
+    Process* nextProcess = readyq_pop_highest();
+    if (nextProcess == NULL)
+    {
+        nextProcess = runningProcess;
+    }
+
+    runningProcess = nextProcess;
+
+    if (runningProcess != NULL)
+    {
+        context_switch(runningProcess->context);
+    }
+    
 }
