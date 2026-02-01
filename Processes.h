@@ -1,5 +1,11 @@
 #pragma once
 
+
+#define STATUS_EMPTY 0 
+#define STATUS_READY 1 
+#define STATUS_RUNNING 2
+#define STATUS_BLOCKED 3
+#define STATUS_QUIT 4 
 typedef struct _process
 {
 	struct _process*        nextReadyProcess;
@@ -7,6 +13,10 @@ typedef struct _process
 
 	struct _process*		pParent;   
 	struct _process*        pChildren;
+	struct _process*        pActiveChildren;
+	struct _process*        pChildrenThatExited;
+	struct _process*        pJoiners;
+	
 
 	char           name[MAXNAME];     /* Process name */
 	char           startArgs[MAXARG]; /* Process arguments */
