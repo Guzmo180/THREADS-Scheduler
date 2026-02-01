@@ -1,4 +1,3 @@
-
 #define _CRT_SECURE_NO_WARNINGS
 #define NUM_PRIORITIES 6
 #define MAX_PID 51
@@ -64,7 +63,7 @@ int bootstrap(void* pArgs)
     {
         processTable[i].pid = 0; // mark process table entry as empty
     }
-
+    
     /* Initialize the Ready list, etc. */
     readyProcs[0] = NULL;
     /* Initialize the clock interrupt handler */
@@ -86,14 +85,14 @@ int bootstrap(void* pArgs)
         console_output(debugFlag, "Scheduler(): spawn for SchedulerEntryPoint returned an error (%d), stopping...\n", result);
         stop(1);
     }
-    enable_interrupts(runningProcess);
-    dispatcher(runningProcess);
-        printf("%c is result", result);
-        /* Initialized and ready to go!! */
+    enable_interrupts();
+    dispatcher();
+    printf("%c is result", result);
+    /* Initialized and ready to go!! */
 
-        /* This should never return since we are not a real process. */
+    /* This should never return since we are not a real process. */
 
-        stop(-3);
+    stop(-3);
     return 0;
 
 }
@@ -136,9 +135,51 @@ int k_spawn(char* name, int (*entryPoint)(void*), void* arg, int stacksize, int 
     }
 
 
+    /*Testing for kernel mode*/
+    unsigned int psr = get_psr();
+    if ((psr & PSR_KERNEL_MODE) == 0)
+    {
+        console_output(debugFlag, "spawn(): Kernel mode is required. \n");
+        return -1;
+    }
+
+    /*entrypoint validation*/
+    if (entryPoint == NULL)
+    {
+        console_output(debugFlag, "spawn(): Entry point value is NULL.\n");
+        return -1;
+    }
+    /*Checking stack size and priorities*/
+    if (stacksize < THREADS_MIN_STACK_SIZE)
+    {
+        console_output(debugFlag, "spawn():  Stack size is to small.\n");
+        return -1;
+    }
+    if (priority < LOWEST_PRIORITY || priority > HIGHEST_PRIORITY)
+    {
+        console_output(debugFlag, "spawn():  Priority value is invalid.\n");
+        return -1;
+    }
     /* Find an empty slot in the process table */
 
-    proc_slot = 1;  // just use 1 for now!
+    proc_slot = -1;  // just use 1 for now! needs to be -1
+    int checkedSlots = 0;
+    int procSlotIndex = 0;
+    while (checkedSlots < MAXPROC)
+    {
+        if (processTable[procSlotIndex].status == STATUS_READY )
+        {
+            proc_slot = procSlotIndex;
+            break;
+        }
+        procSlotIndex = (procSlotIndex + 1) % MAXPROC;
+        checkedSlots++;
+    }
+    if (proc_slot == -1)
+    {
+        console_output(debugFlag, "spawn(): no process slots free. \n");
+        return -1;
+    }
     pNewProc = &processTable[proc_slot];
 
     /* Setup the entry in the process table. */
@@ -186,7 +227,7 @@ static int launch(void* args)
 
     /* Stop the process gracefully */
     k_exit(0);
-    return 0; 
+    return 0;
 }
 
 /**************************************************************************
@@ -314,6 +355,7 @@ void display_process_table()
 void dispatcher()
 {
     Process* nextProcess = NULL;
+    
     //get the next ready process
     clamp_priority(runningProcess->priority);
     nextProcess = readyq_pop_highest();
@@ -321,7 +363,7 @@ void dispatcher()
         console_output(debugFlag, "dispatcher(): No ready process found!  Stopping...\n");
         stop(3);
     }
-    DebugConsole("dispatcher(): switching to process %s (pid %d)\n", *nextProcess->name, nextProcess->pid);
+    DebugConsole("dispatcher(): switching to process %s (pid %d)\n", nextProcess->name, nextProcess->pid);
     runningProcess = nextProcess;
 
     // check the runningproccess time_slice
@@ -495,31 +537,31 @@ Process* readyq_remove_pid(int pid)
 
             cur->nextReadyProcess = NULL;
             return cur;
-            }
-            prev = cur;
-            cur = cur->nextReadyProcess;
         }
-        return NULL;
+        prev = cur;
+        cur = cur->nextReadyProcess;
     }
+    return NULL;
+}
 
-int time_slice()
+void time_slice(void)
 {
     disableInterrupts();
-        if (runningProcess != NULL)
-        {
-            readyq_push(runningProcess);
-        }
+    if (runningProcess != NULL)
+    {
+        readyq_push(runningProcess);
+    }
     Process* nextProcess = readyq_pop_highest();
     if (nextProcess == NULL)
     {
         nextProcess = runningProcess;
     }
 
-    runningProcess = nextProcess; 
+    runningProcess = nextProcess;
 
     if (runningProcess != NULL)
     {
         context_switch(runningProcess->context);
     }
-    return 0;
+    
 }
