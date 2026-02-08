@@ -16,7 +16,6 @@ typedef struct _process
 	struct _process*        pActiveChildren;
 	struct _process*        pChildrenThatExited;
 	struct _process*        pJoiners;
-	
 
 	char           name[MAXNAME];     /* Process name */
 	char           startArgs[MAXARG]; /* Process arguments */
@@ -27,5 +26,12 @@ typedef struct _process
 	char*	       stack;
 	unsigned int   stacksize;
 	int            status;            /* READY, QUIT, BLOCKED, etc. */
-	int			   exitCode;   
+	int			   exitCode;  
+	int 		   signaled;			/* 1 if the process has been signaled to quit, 0 otherwise */
+
+	int            NumChildren;       /* Number of children processes */
+
+	uint32_t     startTime;          /* Time when the process started */
+	uint32_t     CpuTime;       /* Total CPU time used by the process */
+	uint32_t     lastDispatchTime;        /* CPU time used in the last time slice */
 } Process;

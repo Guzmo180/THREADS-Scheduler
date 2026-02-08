@@ -69,7 +69,7 @@ int bootstrap(void* pArgs)
         processTable[i].nextSiblingProcess = NULL;
         processTable[i].pParent = NULL;
         processTable[i].pChildren = NULL;
-        processTable{i].numChildren = 0;
+        processTable[i].numChildren = 0;
         processTable[i].exitCode = 0;
         Procestable[i].signaled = 0;
         processTable[i].cputime = 0;
@@ -362,8 +362,10 @@ int k_kill(int pid, int signal)
    Name - k_getpid
 *************************************************************************/
 int k_getpid()
-{
-    return 0;
+{	if (runningProcess == NULL)
+        return -1;
+	return runningProcess->pid;
+
 }
 
 /**************************************************************************
@@ -371,8 +373,59 @@ int k_getpid()
 ***************************************************************************/
 int k_join(int pid, int* pChildExitCode)
 {
-    return 0;
-}
+    Process* targetProcess;
+
+    if (pchildExitCode == NULL)
+    {
+        return-1;
+    }
+    disableInterrupts();    
+    if (runningProcess==NULL)
+    {
+		ENableInterrupts();
+		return -1;
+	}
+    if (pid = runningProcess->pid)
+    {
+        console_output(debugFlag, "k_join(): A process cannot join on itself.\n");
+        stop(1);
+    }
+
+    targetProcess = readyq_remove_pid(pid);
+	if (targetProcess == NULL)
+	{
+		console_output(debugFlag, "k_join(): No process with pid %d found.\n", pid);
+		enable_interrupts();
+        stop(1);
+	}
+    if( targetProcess == runningProcess->pParent)
+    {
+        console_output(debugFlag, "k_join(): A process cannot join on its parent.\n");
+		stop(2);
+	}
+    while (targetProcess->status != STATUS_QUIT)
+    {
+        enable_interrupts();
+        disableInterrupts();
+
+        if (runningProcess->signaled)
+        {
+            enable_interrupts();
+            return -5;
+        }
+        targetProcess = readyq_remove_pid(pid);
+        if (targetProcess == NULL)
+        {
+            enable_interrupts();
+            return 0;
+        }
+    }
+        *pChildExitCode = targetProcess->exitCode;
+        enable_interrupts();    
+        return 0;
+
+    
+}   
 
 /**************************************************************************
    Name - unblock
@@ -436,12 +489,16 @@ void dispatcher()
 {
     Process* nextProcess = NULL;
 
-    //get the next ready process
-    //if (runningProcess != NULL)
-    //{
-        // clamp_priority(runningProcess->priority);  //try this in kspawn
-    //}
-
+    if(runningProcess != NULL && runningProcess->status == STATUS_RUNNING)
+	{
+		runningProcess->status = STATUS_READY;
+		readyq_push(runningProcess);
+	}
+    if(readyq_pop_highest == NULL)
+    {
+        enable_interrupts();
+        return;
+    }
 
     nextProcess = readyq_pop_highest();
     if (nextProcess == NULL)
@@ -452,6 +509,7 @@ void dispatcher()
 
     runningProcess = nextProcess;
     runningProcess->status = STATUS_RUNNING;
+    currentTime = read_clock();
     DebugConsole("dispatcher(): switching to process %s (pid %d)\n", runningProcess->name, runningProcess->pid);
 
     // check the runningproccess time_slice
