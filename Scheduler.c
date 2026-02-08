@@ -60,12 +60,31 @@ int bootstrap(void* pArgs)
     check_io = check_io_scheduler;
 
     /* Initialize the process table. */
-    runningProcess = NULL;
-    for (int i = 0; i < MAXPROC; i++)
+    int i; 
+    for (i = 0; i < MAXPROC; i++)
     {
-        processTable[i].status = STATUS_EMPTY;
-        processTable[i].pid = 0; // mark process table entry as empty
-    }
+        processTable[i].status = EMPTY;
+        processTable[i].pid = -1;
+        processTable[i].nextReadyProcess = NULL;
+        processTable[i].nextSiblingProcess = NULL;
+        processTable[i].pParent = NULL;
+        processTable[i].pChildren = NULL;
+        processTable{i].numChildren = 0;
+        processTable[i].exitCode = 0;
+        Procestable[i].signaled = 0;
+        processTable[i].cputime = 0;
+        processTable[i].startTime = 0;
+        processTable[i].lastdispatchTime = 0;
+        }
+            //  COWBOYS FOR LIFE!!!!!       
+            // point to head of ready queue need to initialize the ready queue as well
+          
+             
+         
+            nextPid=1; // start at 1 since 0 is reserved for the null process
+
+
+
 
     /* Initialize the Ready list, etc. */
     for (int i = 0; i < NUM_PRIORITIES; i++)
@@ -288,6 +307,7 @@ void k_exit(int code)
 {
     disableInterrupts();
     runningProcess->status = STATUS_QUIT;
+    
     if (runningProcess->pParent != NULL)
     {
         if (runningProcess->pParent->status == STATUS_BLOCKED)
@@ -296,6 +316,7 @@ void k_exit(int code)
             readyq_push(runningProcess->pParent);
         }
     }
+   
     dispatcher();
 
 }
@@ -311,7 +332,29 @@ void k_exit(int code)
 *************************************************************************/
 int k_kill(int pid, int signal)
 {
-    int result = 0;
+    Process* targerProcess;
+
+    disableInterrupts();
+
+    if(signal != SIG_TERM)
+	{
+		console_output(debugFlag, "k_kill(): Invalid signal value.\n");
+		return -1;
+	}   
+    //FIND THE TARGET PROCESS
+    targerProcess = readyq_remove_pid(pid);
+    if( targerProcess == NULL)
+	{
+		console_output(debugFlag, "k_kill(): No process with pid %d found.\n", pid);
+		return -1;
+	}
+    targerProcess->signaled = 1; // set the signaled flag for the target process
+
+	if (targerProcess->status == STATUS_BLOCKED)
+	{
+		targerProcess->status = STATUS_READY;
+		readyq_push(targerProcess);
+	}
     return 0;
 }
 
@@ -352,14 +395,18 @@ int block(int newStatus)
 *************************************************************************/
 int signaled()
 {
-    return 0;
+    if (runningProcess == NULL)
+        return 0; 
+    return runningProcess->signaled;
 }
 /*************************************************************************
    Name - readtime
 *************************************************************************/
 int read_time()
 {
-    return 0;
+    if( runningProcess == NULL)
+		return 0;)
+	return runningProcess->cputime;
 }
 
 /*************************************************************************
@@ -390,10 +437,10 @@ void dispatcher()
     Process* nextProcess = NULL;
 
     //get the next ready process
-    if (runningProcess != NULL)
-    {
+    //if (runningProcess != NULL)
+    //{
         // clamp_priority(runningProcess->priority);  //try this in kspawn
-    }
+    //}
 
 
     nextProcess = readyq_pop_highest();
@@ -438,13 +485,43 @@ static int watchdog(char* dummy)
 /* check to determine if deadlock has occurred... */
 static void check_deadlock()
 {
-    if ((runningProcess->nextReadyProcess == NULL) &&
-        (runningProcess->pChildren == NULL))
-    {
-        console_output(debugFlag, "Deadlock detected by watchdog process!  Stopping...\n"); // output debug message
-        stop(2);// stop the system
-    }
-}
+    int i;
+    int activeProcesses = 0;
+    for (i = 0; i < MAXPROC; i++)
+	{
+		if (processTable[i].status != STATUS_EMPTY && processTable[i].status != STATUS_QUIT)
+		{
+			activeProcesses++;
+		}
+	}
+    	if (activeProcesses == 1)   
+        {
+			console_output(debugFlag, "waxhdog(): no remaining processes.  Stopping...\n");
+            stop(0);
+            }
+        if (activeProcesses >1)
+        {
+            int readyProcesses = 0;
+            int runningProcesses = 0;
+         for( i = 0; i < MAXPROC; i++)  
+             {
+             if (processTable[i].status == STATUS_READY)
+				{
+					readyProcesses++;
+				}
+				else if (processTable[i].status == STATUS_RUNNING)
+				{
+					runningProcesses++;
+				}
+             if (readyProcesses == 0 && runningProcesses == 0)
+             {
+
+                 console_output(debugFlag, "watchdog(): deadlock detected.  Stopping...\n");
+                 stop(1);
+             }  
+        
+            
+            }
 
 /*
  * Disables the interrupts.
