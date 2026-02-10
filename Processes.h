@@ -29,9 +29,9 @@ typedef struct _process
 	int			   exitCode;  
 	int 		   signaled;			/* 1 if the process has been signaled to quit, 0 otherwise */
 
-	int            NumChildren;       /* Number of children processes */
+	int            numChildren;       /* Number of children processes */
 
 	uint32_t     startTime;          /* Time when the process started */
-	uint32_t     CpuTime;       /* Total CPU time used by the process */
+	uint32_t     cpuTime;       /* Total CPU time used by the process */
 	uint32_t     lastDispatchTime;        /* CPU time used in the last time slice */
 } Process;
