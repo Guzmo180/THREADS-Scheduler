@@ -1,32 +1,31 @@
 #define _CRT_SECURE_NO_WARNINGS
-
+#define EMPTY 0
+#define NUM_PRIORITIES 6
 #include <stdio.h>
-#include <string.h>
-#include <stdarg.h>
 #include "THREADSLib.h"
 #include "Scheduler.h"
 #include "Processes.h"
 
-/* Global data structures */
-Process processTable[MAX_PROCESSES];
-Process *runningProcess = NULL;
-Process *readyQueueHead = NULL;      /* Head of ready queue (priority ordered) */
+void readyq_push(Process* proc);  //fixed the 2371 error
+Process* readyq_pop_highest(void);
+Process* readyq_remove_pid(int pid);
+Process* readyProcs[NUM_PRIORITIES];
+Process processTable[MAXPROC];
+Process* runningProcess = NULL;
 int nextPid = 1;
 int debugFlag = 1;
 
-/* Timer constants */
-#define TIME_SLICE_QUANTUM 80           /* Time slice in milliseconds */
-
+static void initialize_process_table();
 static int watchdog(char*);
 static inline void disableInterrupts();
-static inline void enableInterrupts();
+static inline void enable_interrupts();
+static int clamp_priority(int priority);
 void dispatcher();
-static int launch(void *);
+static int launch(void*);
 static void check_deadlock();
-static void DebugConsole(char* format, ...);
-static void addToReadyQueue(Process *process);
-static void removeFromReadyQueue(Process *process);
-static void timerInterruptHandler(char deviceId[32], uint8_t command, uint32_t status);
+static void DebugConsole(format, ...);
+static void clock_handler(char* devicename, uint8_t command, uint32_t status);
+
 
 /* DO NOT REMOVE */
 extern int SchedulerEntryPoint(void* pArgs);
@@ -34,13 +33,873 @@ int check_io_scheduler();
 check_io_function check_io;
 
 
-/*
- * Initialize process table and ready queue
- */
-static void initializeProcessTable()
+/*************************************************************************
+   bootstrap()
+
+   Purpose - This is the first function called by THREADS on startup.
+
+             The function must setup the OS scheduler and primitive
+             functionality and then spawn the first two processes.
+
+             The first two process are the watchdog process
+             and the startup process SchedulerEntryPoint.
+
+             The statup process is used to initialize additional layers
+             of the OS.  It is also used for testing the scheduler
+             functions.
+
+   Parameters - Arguments *pArgs - these arguments are unused at this time.
+
+   Returns - The function does not return!
+
+   Side Effects - The effects of this function is the launching of the kernel.
+
+ *************************************************************************/
+int bootstrap(void* pArgs)
+{
+    int result; /* value returned by call to spawn() */
+
+    /* set this to the scheduler version of this function.*/
+    check_io = check_io_scheduler;
+
+    /* Initialize the process table. */
+    initialize_process_table();
+
+
+
+
+
+    /* Initialize the Ready list, etc. */
+    for (int i = 0; i < NUM_PRIORITIES; i++)
+    {
+        readyProcs[i] = NULL;
+    }
+    //readyProcs[0] = NULL;
+
+    /* Initialize the clock interrupt handler */
+    interrupt_handler_t* handlers;
+    handlers = get_interrupt_handlers();
+    handlers[THREADS_TIMER_INTERRUPT] = time_slice;  //removed the comment out
+
+
+    /* startup a watchdog process */
+    result = k_spawn("watchdog", watchdog, NULL, THREADS_MIN_STACK_SIZE, LOWEST_PRIORITY);
+    if (result < 0)
+    {
+        console_output(debugFlag, "Scheduler(): spawn for watchdog returned an error (%d), stopping...\n", result);
+        stop(1);
+    }
+
+    /*start the test process, which is the main for each test program.*/
+    result = k_spawn("Scheduler", SchedulerEntryPoint, NULL, 2 * THREADS_MIN_STACK_SIZE, HIGHEST_PRIORITY);
+    if (result < 0)
+    {
+        console_output(debugFlag, "Scheduler(): spawn for SchedulerEntryPoint returned an error (%d), stopping...\n", result);
+        stop(1);
+    }
+    enable_interrupts();
+    dispatcher();
+    //printf("%c is result", result);
+
+    /*Initialized and ready to go!!*/
+
+    /*This should never return since we are not a real process.*/
+
+    stop(-3);
+    return 0;
+
+}
+
+/*************************************************************************
+   k_spawn()
+
+   Purpose - spawns a new process.
+
+             Finds an empty entry in the process table and initializes
+             information of the process.  Updates information in the
+             parent process to reflect this child process creation.
+
+   Parameters - the process's entry point function, the stack size, and
+                the process's priority.
+
+   Returns - The Process ID (pid) of the new child process
+             The function must return if the process cannot be created.
+
+************************************************************************ */
+int k_spawn(char* name, int (*entryPoint)(void*), void* arg, int stacksize, int priority)
+{
+    int proc_slot = -1;
+    struct _process* pNewProc;
+    Process* pParent;// we can use this variable to keep track of the parent process if there is one, but it's not strictly necessary since we can always access the parent through the runningProcess variable if needed
+
+    DebugConsole("spawn(): creating process %s\n", name);
+
+    disableInterrupts();
+
+    /*Validate all of the parameters, starting with the name.*/
+    if (name == NULL || entryPoint == NULL)// if the name or entry point is NULL, we cannot create the process, so return -1 to indicate an error
+    {
+        console_output(debugFlag, "spawn(): Name value is NULL.\n");
+        return -1;
+    }
+    if (strlen(name) >= (MAXNAME - 1))// if the name is too long, we cannot create the process, so stop the system since this is a critical error that should not happen in normal operation
+    {
+        console_output(debugFlag, "spawn(): Process name is too long.  Halting...\n");
+        stop(1);
+    }
+    if (stacksize < THREADS_MIN_STACK_SIZE)// if the stack size is too small, we cannot create the process, so stop the system since this is a critical error that should not happen in normal operation
+    {
+        console_output(debugFlag, "spawn(): Stack size is too small.  Halting...\n");
+        stop(1);// if the stack size is too small, we cannot create the process, so stop the system
+    }
+    if (priority < LOWEST_PRIORITY || priority > HIGHEST_PRIORITY)
+    {
+        enable_interrupts();
+        return -3; // if the priority is invalid, return -3 to indicate an error
+    }
+    /*Testing for kernel mode*/
+    unsigned int psr = get_psr();
+    if ((psr & PSR_KERNEL_MODE) == 0)
+    {
+        console_output(debugFlag, "spawn(): Kernel mode is required. \n");
+        return -1;
+    }
+
+    /*entrypoint validation find empty PCB slot*/
+    proc_slot = findEmptyProcessSlot();
+    if (proc_slot < 0)
+    {
+        enable_interrupts();
+        return -4; // if there are no empty slots in the process table, return -4 to indicate that we cannot create a new process
+    }
+
+    //initialiZe the new process slot in the process table
+    pNewProc = &processTable[proc_slot];// get a pointer to the new process slot in the process table
+    pNewProc->pid = nextPid++;// assign a unique pid to the new process and increment the nextPid counter for the next process that will be created
+    pNewProc->status = STATUS_READY;// set the initial status of the new process to ready
+    pNewProc->priority = clamp_priority(priority);// set the priority of the new process to the value passed in as a parameter, but clamp it to the valid range of priorities
+    pNewProc->entryPoint = entryPoint;// set the entry point of the new process to the function pointer passed in as a parameter
+    pNewProc->stacksize = stacksize;// set the stack size of the new process to the value passed in as a parameter
+    pNewProc->exitCode = 0;// initialize the exit code of the new process to 0
+    pNewProc->signaled = 0;
+    pNewProc->numChildren = 0; // initialize the number of children of the new process to 0
+    pNewProc->startTime = system_clock() * 1000; // set the start time to the current system clock time in milliseconds
+    pNewProc->cpuTime = 0; // initialize the CPU time used by the new process to 0
+    pNewProc->lastDispatchTime = 0; // initialize the last dispatch time to 0
+    pNewProc->nextReadyProcess = NULL; // initialize the next ready process pointer to NULL since this process is not yet in the ready queue            
+
+
+
+    /*Link child to parent*/
+    if (runningProcess != NULL)
+    {
+        pNewProc->pParent = runningProcess;
+
+        /*Insert child at head of parent's child list */
+        pNewProc->nextSiblingProcess = runningProcess->pChildren;
+        runningProcess->pChildren = pNewProc;
+
+        /*Increment child count*/
+        runningProcess->numChildren++;
+    }
+    else
+    {
+        pNewProc->pParent = NULL;
+    }
+
+    /* Add the process to the ready list. */
+    readyq_push(pNewProc);
+    enable_interrupts();
+    DebugConsole("k_spawn(): process %s (pid %d) created with priority %d and stack size %d\n", name, pNewProc->pid, pNewProc->priority, pNewProc->stacksize);
+    //Initialize context for this process, but use launch function pointer for
+
+
+    pNewProc->context = context_initialize(launch, stacksize, arg);
+
+    return pNewProc->pid;
+
+
+} /* spawn */
+
+/**************************************************************************
+   Name - launch
+
+   Purpose - Utility function that makes sure the environment is ready,
+             such as enabling interrupts, for the new process.
+
+   Parameters - none
+
+   Returns - nothing
+*************************************************************************/
+static int launch(void* args)
+{
+    int exitCode;
+    DebugConsole("launch(): started: %s\n", runningProcess->name);
+
+    /* Enable interrupts */
+    enable_interrupts();
+    exitCode =runningProcess->entryPoint(args); // call the entry point function for this process and capture the exit code when it returns
+    // We are now running in the context of the new process, so we can call the function that was passed in as the entry point for this process.  We will also pass in the arguments that were passed to k_spawn as the argument to the entry point function.
+    //clamp_priority(runningProcess->priority); // make sure the priority is clamped to the valid range before we start running the process, just in case it was changed after the process was created but before it was launched
+    //SchedulerEntryPoint(args);
+    
+
+
+     
+    /* Stop the process gracefully */
+     // wait for any child processes to exit and get their exit codes, but ignore the return value since we are exiting anyway
+    
+    k_exit(exitCode); // exit the process with the return value from the entry point function as the exit code
+    return 0;
+}
+
+/**************************************************************************
+   Name - k_wait
+
+   Purpose - Wait for a child process to quit.  Return right away if
+             a child has already quit.
+
+   Parameters - Output parameter for the child's exit code.
+
+   Returns - the pid of the quitting child, or
+        -4 if the process has no children
+        -5 if the process was signaled in the join
+
+************************************************************************ */
+int  k_wait(int* pChildExitCode)
+{
+    
+    Process* child;
+    int childPid = -1;
+    int hasActiveChildren;
+
+    if (pChildExitCode == NULL)
+    {
+        return -1;
+    }
+    while (1)
+    {
+        disableInterrupts();
+
+        if (runningProcess == NULL)
+        {
+            enable_interrupts();
+            return -1;
+        }
+
+        /* Check if signaled while waiting */
+        if (runningProcess->signaled)
+        {
+           enable_interrupts();
+            return -5;
+        }
+
+        /* Look for a child that has already exited */
+        child = runningProcess->pChildren;
+        while (child != NULL)
+        {
+            if (child->status == STATUS_QUIT)
+            {
+                childPid = child->pid;
+                pChildExitCode = &child->exitCode;
+
+                /* Remove child from parent's list */
+                if (child == runningProcess->pChildren)
+                {
+                    runningProcess->pChildren = child->nextSiblingProcess;
+                }
+                else
+                {
+                    Process* temp = runningProcess->pChildren;
+                    while (temp != NULL && temp->nextSiblingProcess != child)
+                        temp = temp->nextSiblingProcess;
+                    if (temp != NULL)
+                        temp->nextSiblingProcess = child->nextSiblingProcess;
+                }
+            }
+                /* Clean up the exited process */
+                child->status = EMPTY;
+                child->pid = -1;
+
+                enable_interrupts();
+                return childPid;
+        }
+            child = child->nextSiblingProcess;
+     }
+
+        /* Check if there are any active (non-exited) children */
+        hasActiveChildren = 0;
+        child = runningProcess->pChildren;
+        while (child != NULL)
+        {
+            if (child->status != STATUS_QUIT && child->status != EMPTY)
+            {
+                hasActiveChildren = 1;
+                break;
+            }
+            child = child->nextSiblingProcess;
+        }
+
+        /* If there are active children, block the process and dispatch to another */
+        if (hasActiveChildren)
+        {
+            DebugConsole("k_wait(): process %s (pid %d) blocked waiting for children\n",
+                runningProcess->name, runningProcess->pid);
+            runningProcess->status = STATUS_BLOCKED;
+            enable_interrupts();
+            dispatcher();
+            /* When resumed here (after a child exits and unblocks us), loop back to check for exited children */
+        }
+        else
+        {
+            /* If no active children and no exited children, return error */
+            enable_interrupts(); 
+            return -1;
+        }
+    
+}
+
+/**************************************************************************
+   Name - k_exit
+
+   Purpose - Exits a process and coordinates with the parent for cleanup
+             and return of the exit code.
+
+   Parameters - the code to return to the grieving parent
+
+   Returns - nothing
+
+*************************************************************************/
+void k_exit(int code)
+{
+    Process* parent;
+    //test for if need to be new process Process *pParent; 
+
+
+    disableInterrupts();
+
+    if (runningProcess == NULL)
+    {
+        enable_interrupts();
+        return;
+    }
+
+    if (runningProcess->numChildren > 0)
+    {
+        console_output(debugFlag, "k_exit(): Process %d has %d children.  Cannot exit until all children have exited.\n", runningProcess->pid, runningProcess->numChildren);
+        enable_interrupts();
+        stop(1);
+    }
+    if (runningProcess->signaled)
+    {
+        runningProcess->exitCode = -5; // set the exit code to -5 to indicate that the process was signaled to quit
+        runningProcess->status = STATUS_QUIT; // set the process status to quit
+
+
+        parent = runningProcess->pParent;
+        if (parent != NULL)
+        {
+            parent->numChildren--; // decrement the parent's child count
+            if (parent->status == STATUS_BLOCKED)
+            {
+                parent->status = STATUS_READY; // unblock the parent if it was waiting for this child to exit
+                readyq_push(parent);
+            }
+        }
+        DebugConsole("k_exit(): Process %d was signaled to quit. Exiting with code -5.\n", runningProcess->pid);
+        runningProcess = NULL; // set the running process to NULL since this process is exiting
+        enable_interrupts();
+        dispatcher(); // call the dispatcher to switch to another process since this process is exiting
+    }
+}
+
+/**************************************************************************
+   Name - k_kill
+
+   Purpose - Signals a process with the specified signal
+
+   Parameters - Signal to send
+
+   Returns -
+*************************************************************************/
+int k_kill(int pid, int signal)
+{
+    Process* targetProcess;
+
+    disableInterrupts();
+
+    if (signal != SIG_TERM)
+    {
+        console_output(debugFlag, "k_kill(): Invalid signal value.\n");
+        return -1;
+    }
+    //FIND THE TARGET PROCESS
+    targetProcess = readyq_remove_pid(pid);
+    if (targetProcess == NULL)
+    {
+        console_output(debugFlag, "k_kill(): No process with pid %d found.\n", pid);
+        return -1;
+    }
+    targetProcess->signaled = 1; // set the signaled flag for the target process
+
+    if (targetProcess->status == STATUS_BLOCKED)
+    {
+        targetProcess->status = STATUS_READY;
+        readyq_push(targetProcess);
+    }
+    return 0;
+}
+
+/**************************************************************************
+   Name - k_getpid
+*************************************************************************/
+int k_getpid()
+{
+    if (runningProcess == NULL)
+        return -1;
+    return runningProcess->pid;
+
+}
+
+/**************************************************************************
+   Name - k_join
+***************************************************************************/
+int k_join(int pid, int* pChildExitCode)
+{
+    Process* targetProcess;
+
+    if (pChildExitCode == NULL)
+    {
+        return-1;
+    }
+    disableInterrupts();
+    if (runningProcess == NULL)
+    {
+        enable_interrupts();
+        return -1;
+    }
+    if (pid == runningProcess->pid)  //add =
+    {
+        console_output(debugFlag, "k_join(): A process cannot join on itself.\n");
+        stop(1);
+    }
+
+    targetProcess = readyq_remove_pid(pid);
+    if (targetProcess == NULL)
+    {
+        console_output(debugFlag, "k_join(): No process with pid %d found.\n", pid);
+        enable_interrupts();
+        stop(1);
+    }
+    if (targetProcess == runningProcess->pParent)
+    {
+        console_output(debugFlag, "k_join(): A process cannot join on its parent.\n");
+        stop(2);
+    }
+    while (&targetProcess->status != STATUS_QUIT)
+    {
+        enable_interrupts();
+        disableInterrupts();
+
+        if (runningProcess->signaled)
+        {
+            enable_interrupts();
+            return -5;
+        }
+        targetProcess = readyq_remove_pid(pid);
+        if (targetProcess == NULL)
+        {
+            enable_interrupts();
+            return 0;
+        }
+    }
+    *pChildExitCode = targetProcess->exitCode;
+    enable_interrupts();
+    return 0;
+
+
+}
+
+/**************************************************************************
+   Name - unblock
+*************************************************************************/
+int unblock(int pid)
+{
+    Process* targetProcess; // find the process with the specified pid in the process table
+    disableInterrupts();
+
+    targetProcess = readyq_remove_pid(pid);// remove the target process from the ready queue if it's there
+    if (targetProcess == NULL || targetProcess->status <= 10) // check if the target process is valid and is currently blocked (status > 10)
+    {
+        enable_interrupts();
+        return(-1);
+    }
+    targetProcess->status = STATUS_READY; // set the target process status to ready
+    readyq_push(targetProcess); // add the target process back to the ready queue
+    enable_interrupts();
+    return 0; // return 0 for success
+}
+
+/*************************************************************************
+   Name - block
+*************************************************************************/
+int block(int blockStatus)
+{
+    disableInterrupts();
+    if (blockStatus <= 10) // we can define some block status codes if we want, but for now just check that it's a valid value
+    {
+        console_output(debugFlag, "block(): Invalid block status value.\n");
+        stop(1);
+    }
+    if (runningProcess == NULL)// if there is no running process, we cannot block, so return -1 to indicate an error
+    {
+        enable_interrupts(); // enable interrupts before returning since we disabled them at the start of the function
+        return -1;
+    }
+    if (runningProcess->signaled)// if the process has been signaled to quit, return -5 to indicate that it should not block and should instead exit
+    {
+        enable_interrupts();
+        return -5;
+    }
+    runningProcess->status = blockStatus;// set the process status to the specified block status
+    enable_interrupts();// enable interrupts before calling thedispatcher
+    dispatcher();// call the dispatcher to switch to another process since the current process is now blocked
+    return 0; // return value is not used, but we can return 0 for success
+}
+
+/*************************************************************************
+   Name - signaled
+*************************************************************************/
+int signaled()
+{
+    if (runningProcess == NULL)
+        return 0;
+    return runningProcess->signaled;
+}
+/*************************************************************************
+   Name - readtime
+*************************************************************************/
+int read_time()
+{
+    if (runningProcess == NULL)
+        return 0;
+    return runningProcess->cpuTime;
+}
+
+/*************************************************************************
+   Name - readClock
+*************************************************************************/
+DWORD read_clock()
+{
+    return system_clock(); // read the current time from the system clock
+}
+
+void display_process_table()
 {
     int i;
+    char StatusStr[32];
+    console_output(debugFlag, "%-5s %-7s %-10s %-12s %-6s %-8s %s\n", "PID", "Parent", "Priority", "Status", "#KIDS", "CPUtime", "Name"); // header for the process table
+
     for (i = 0; i < MAX_PROCESSES; i++)
+    {
+        if (processTable[i].status != STATUS_EMPTY) // only display processes that are not empty
+        {
+            switch (processTable[i].status) // convert the status code to a string for display
+            {
+            case STATUS_READY: // if the process is ready, set the status string to "READY"
+                strcpy(StatusStr, "READY");
+                break;
+            case STATUS_RUNNING: // if the process is running, set the status string to "RUNNING"
+                strcpy(StatusStr, "RUNNING");
+                break;
+            case STATUS_BLOCKED: // if the process is blocked, set the status string to "BLOCKED"
+                strcpy(StatusStr, "BLOCKED");
+                break;
+            case STATUS_QUIT: // if the process has quit, set the status string to "QUIT"
+                strcpy(StatusStr, "QUIT");
+                break;
+            default:
+                strcpy(StatusStr, "UNKNOWN");// if the status code is not recognized, set the status string to "UNKNOWN"
+            }
+            console_output(debugFlag, "%-5d %-7d %-10d %-12s %-6d %-8d %s\n",
+                processTable[i].pid,
+                processTable[i].pParent ? processTable[i].pParent->pid : -1,// print the parent process ID or -1 if there is no parent
+                processTable[i].priority,// print the process priority
+                StatusStr,
+                processTable[i].numChildren,// print the number of children processes
+                processTable[i].cpuTime, //print the CPU time used by the process
+                processTable[i].name);// print the process information in a formatted way
+        }
+    }
+}
+
+/**************************************************************************
+   Name - dispatcher
+
+   Purpose - This is where context changes to the next process to run.
+
+   Parameters - none
+
+   Returns - nothing
+
+*************************************************************************/
+void dispatcher()
+{
+    Process* nextProcess = NULL;
+
+    if (runningProcess != NULL && runningProcess->status == STATUS_RUNNING)
+    {
+        runningProcess->status = STATUS_READY;
+        readyq_push(runningProcess);
+    }
+    if (readyq_pop_highest == NULL)
+    {
+        enable_interrupts();
+        return;
+    }
+
+    nextProcess = readyq_pop_highest();
+    if (nextProcess == NULL)
+    {
+        console_output(debugFlag, "dispatcher(): No ready process found!  Stopping...\n");
+        stop(3);
+    }
+    int currentTime = 0;
+    runningProcess = nextProcess;
+    runningProcess->status = STATUS_RUNNING;
+    currentTime = read_clock();
+    DebugConsole("dispatcher(): switching to process %s (pid %d)\n", runningProcess->name, runningProcess->pid);
+
+    // check the runningproccess time_slice
+    //time_slice();
+    context_switch(runningProcess->context);
+
+}
+
+
+/**************************************************************************
+   Name - watchdog
+
+   Purpose - The watchdoog keeps the system going when all other
+         processes are blocked.  It can be used to detect when the system
+         is shutting down as well as when a deadlock condition arises.
+
+   Parameters - none
+
+   Returns - nothing
+   *************************************************************************/
+static int watchdog(char* dummy)
+{
+    DebugConsole("watchdog(): called\n");
+    while (1)
+    {
+        check_deadlock();
+    }
+    return 0;
+}
+
+/* check to determine if deadlock has occurred... */
+static void check_deadlock()
+{
+    int i;
+    int activeProcesses = 0;
+    for (i = 0; i < MAXPROC; i++)
+    {
+        if (processTable[i].status != STATUS_EMPTY && processTable[i].status != STATUS_QUIT)
+        {
+            activeProcesses++;
+        }
+    }
+    if (activeProcesses == 1)
+    {
+        console_output(debugFlag, "waxhdog(): no remaining processes.  Stopping...\n");
+        stop(0);
+    }
+    if (activeProcesses > 1)
+    {
+        int readyProcesses = 0;
+        int runningProcesses = 0;
+        for (i = 0; i < MAXPROC; i++)
+        {
+            if (processTable[i].status == STATUS_READY)
+            {
+                readyProcesses++;
+            }
+            else if (processTable[i].status == STATUS_RUNNING)
+            {
+                runningProcesses++;
+            }
+            if (readyProcesses == 0 && runningProcesses == 0)
+            {
+
+                console_output(debugFlag, "watchdog(): deadlock detected.  Stopping...\n");
+                stop(1);
+            }
+
+
+        }
+    }
+}
+
+/*
+ * Disables the interrupts.
+ */
+static inline void disableInterrupts()
+{
+    /* We ARE in kernel mode */
+    int psr = get_psr();
+    psr = psr & ~PSR_INTERRUPTS;
+    set_psr(psr);
+}
+/* disableInterrupts */
+static inline void enable_interrupts()
+{
+    int psr = get_psr();
+
+    psr = psr | PSR_INTERRUPTS; // enable interrupts
+
+    set_psr(psr);
+}
+/* We ARE in kernel mode */
+/**************************************************************************
+   Name - DebugConsole
+   Purpose - Prints  the message to the console_output if in debug mode
+   Parameters - format string and va args
+   Returns - nothing
+   Side Effects -
+*************************************************************************/
+static void DebugConsole(char* format, ...)
+{
+    char buffer[128];
+    va_list argptr;
+
+    if (debugFlag)
+    {
+        va_start(argptr, format);
+        vsnprintf(buffer, sizeof(buffer), format, argptr);
+        console_output(TRUE, buffer);
+        va_end(argptr);
+
+    }
+}
+
+
+/* there is no I/O yet, so return false. */
+int check_io_scheduler()
+{
+    return false;
+}
+
+
+
+static int clamp_priority(int priority) //
+{
+    if (priority < 0)
+    {
+        return 0;
+    }
+    if (priority >= NUM_PRIORITIES)
+    {
+        return NUM_PRIORITIES - 1;
+
+    }
+    return priority;
+
+}
+
+void readyq_push(Process* proc) // push a process onto the ready queue based on its priority
+{
+    if (proc == NULL) return;
+    int prio = clamp_priority(proc->priority);
+    proc->nextReadyProcess = NULL;
+    if (readyProcs[prio] == NULL) {
+        readyProcs[prio] = proc;
+        return;
+    }
+
+    Process* cur = readyProcs[prio];
+    while (cur->nextReadyProcess != NULL) {
+        cur = cur->nextReadyProcess;
+    }
+    cur->nextReadyProcess = proc;
+}
+
+Process* readyq_pop_prio(int prio)
+{
+    prio = clamp_priority(prio);
+    Process* head = readyProcs[prio];
+    if (head == NULL) return NULL;
+    readyProcs[prio] = head->nextReadyProcess;
+    head->nextReadyProcess = NULL;
+    return head;
+}
+
+Process* readyq_pop_highest(void) // Pop the highest priority process
+{
+    for (int prio = NUM_PRIORITIES - 1; prio >= 0; prio--)
+    {
+        if (readyProcs[prio] != NULL)
+        {
+            return readyq_pop_prio(prio);
+        }
+    }
+    return NULL;
+}
+
+Process* readyq_remove_pid(int pid)
+{
+    Process* target = &processTable[pid % MAXPROC];
+    int prio = clamp_priority(target->priority);
+    Process* prev = NULL;
+    Process* cur = readyProcs[prio];
+
+    while (cur != NULL)
+    {
+        if (cur == target)
+        {
+            if (prev == NULL)
+            {
+                readyProcs[prio] = cur->nextReadyProcess;
+            }
+
+            else {
+                prev->nextReadyProcess = cur->nextReadyProcess;
+            }
+
+            cur->nextReadyProcess = NULL;
+            return cur;
+        }
+        prev = cur;
+        cur = cur->nextReadyProcess;
+    }
+    return NULL;
+}
+
+void time_slice(void)
+{
+    uint32_t currentTime;
+
+    if (runningProcess == NULL)
+        return;
+    currentTime = read_clock();
+    runningProcess->cpuTime += (currentTime - runningProcess->lastDispatchTime);
+    runningProcess->lastDispatchTime = currentTime;
+
+    if (runningProcess->cpuTime >= 80)
+    {
+        dispatcher();
+    }
+
+}
+static void clock_handler(char* devicename, uint8_t command, uint32_t status)
+{
+    time_slice();
+}
+
+static void initialize_process_table()
+{
+    int i;
+    for (i = 0; i < MAXPROC; i++)
     {
         processTable[i].status = EMPTY;
         processTable[i].pid = -1;
@@ -55,928 +914,31 @@ static void initializeProcessTable()
         processTable[i].startTime = 0;
         processTable[i].lastDispatchTime = 0;
     }
-    readyQueueHead = NULL;
-    nextPid = 1;
+
+    readyq_push(NULL); // initialize the ready queue with a NULL value to indicate that it's empty
+    nextPid = 1; // start at 1 since 0 is reserved for the null process
 }
 
-/*
- * Find an empty slot in the process table
- */
 static int findEmptyProcessSlot()
 {
-    int i;
-    for (i = 0; i < MAX_PROCESSES; i++)
+    for (int i = 0; i < MAXPROC; i++)// loop through the process table to find an empty slot
     {
-        if (processTable[i].status == EMPTY)
+        if (processTable[i].status == STATUS_EMPTY)
+        {
             return i;
+        }
     }
-    return -1;  /* No empty slots */
+    return -1; // no empty slot found
 }
 
-/*
- * Get process by PID
- */
-static Process* getProcessByPid(int pid)
+static Process* findProcessByPid(int pid)
 {
-    int i;
-    for (i = 0; i < MAX_PROCESSES; i++)
+    for (int i = 0; i < MAXPROC; i++)// loop through the process table to find the process with the specified pid
     {
-        if (processTable[i].pid == pid && processTable[i].status != EMPTY)
+        if (processTable[i].pid == pid && processTable[i].status != STATUS_EMPTY)
+        {
             return &processTable[i];
-    }
-    return NULL;
-}
-
-/*
- * Add a process to the ready queue in priority order
- */
-static void addToReadyQueue(Process *process)
-{
-    Process *current, *prev;
-
-    if (process == NULL)
-        return;
-
-    process->nextReadyProcess = NULL;
-
-    /* If queue is empty, add as head */
-    if (readyQueueHead == NULL)
-    {
-        readyQueueHead = process;
-        return;
-    }
-
-    /* Find correct position based on priority (higher priority = earlier in queue) */
-    prev = NULL;
-    current = readyQueueHead;
-    
-    while (current != NULL && current->priority >= process->priority)
-    {
-        prev = current;
-        current = current->nextReadyProcess;
-    }
-
-    /* Insert process */
-    process->nextReadyProcess = current;
-    if (prev == NULL)
-        readyQueueHead = process;
-    else
-        prev->nextReadyProcess = process;
-}
-
-/*
- * Remove a process from the ready queue
- */
-static void removeFromReadyQueue(Process *process)
-{
-    Process *current, *prev;
-
-    if (process == NULL || readyQueueHead == NULL)
-        return;
-
-    prev = NULL;
-    current = readyQueueHead;
-
-    while (current != NULL)
-    {
-        if (current == process)
-        {
-            if (prev == NULL)
-                readyQueueHead = current->nextReadyProcess;
-            else
-                prev->nextReadyProcess = current->nextReadyProcess;
-            process->nextReadyProcess = NULL;
-            return;
-        }
-        prev = current;
-        current = current->nextReadyProcess;
-    }
-}
-
-/*
- * Timer interrupt handler
- */
-static void timerInterruptHandler(char deviceId[32], uint8_t command, uint32_t status)
-{
-    /* Call time_slice to check if quantum expired */
-    time_slice();
-}
-
-/*
- * Disables the interrupts
- */
-static inline void disableInterrupts()
-{
-    int psr = get_psr();
-    psr = psr & ~PSR_INTERRUPTS;
-    set_psr(psr);
-}
-
-/*
- * Enables the interrupts
- */
-static inline void enableInterrupts()
-{
-    int psr = get_psr();
-    psr = psr | PSR_INTERRUPTS;
-    set_psr(psr);
-}
-
-/*
- * bootstrap()
- * 
- * This is the first function called by THREADS on startup.
- * The function must setup the OS scheduler and primitive functionality
- * and then spawn the first two processes: watchdog and SchedulerEntryPoint.
- */
-int bootstrap(void *pArgs)
-{
-    int result;
-    interrupt_handler_t *interruptHandlers;
-
-    /* Set this to the scheduler version of this function */
-    check_io = check_io_scheduler;
-
-    /* Initialize the process table and ready queue */
-    initializeProcessTable();
-
-    /* Initialize interrupt handlers - set only timer interrupt */
-    interruptHandlers = get_interrupt_handlers();
-    interruptHandlers[THREADS_TIMER_INTERRUPT] = timerInterruptHandler;
-    interruptHandlers[THREADS_IO_INTERRUPT] = NULL;
-    interruptHandlers[THREADS_EXCEPTION_INTERRUPT] = NULL;
-    interruptHandlers[THREADS_SYS_CALL_INTERRUPT] = NULL;
-
-    /* Enable interrupts */
-    enableInterrupts();
-
-    /* Spawn the watchdog process (lowest priority) */
-    result = k_spawn("watchdog", watchdog, NULL, THREADS_MIN_STACK_SIZE, LOWEST_PRIORITY);
-    if (result < 0)
-    {
-        console_output(debugFlag, "bootstrap(): spawn for watchdog returned error (%d)\n", result);
-        stop(1);
-    }
-
-    /* Spawn the SchedulerEntryPoint process (highest priority) */
-    result = k_spawn("Scheduler", SchedulerEntryPoint, NULL, 2 * THREADS_MIN_STACK_SIZE, HIGHEST_PRIORITY);
-    if (result < 0)
-    {
-        console_output(debugFlag, "bootstrap(): spawn for SchedulerEntryPoint returned error (%d)\n", result);
-        stop(1);
-    }
-
-    /* Dispatch to the first ready process */
-    dispatcher();
-
-    /* Should never reach here */
-    stop(-3);
-    return 0;
-}
-
-/*
- * k_spawn()
- * 
- * Spawns a new process with the given parameters.
- * Returns the PID on success, or an error code on failure.
- */
-int k_spawn(char* name, int (*entryPoint)(void *), void* arg, int stacksize, int priority)
-{
-    int proc_slot;
-    Process *pNewProc;
-    Process *pParent;
-
-    disableInterrupts();
-
-    /* Validate parameters */
-    if (name == NULL || entryPoint == NULL)
-    {
-        enableInterrupts();
-        return -1;
-    }
-
-    if (strlen(name) >= THREADS_MAX_NAME)
-    {
-        console_output(debugFlag, "k_spawn(): Process name too long. Halting.\n");
-        stop(1);
-    }
-
-    if (arg != NULL && strlen((char*)arg) >= THREADS_MAX_NAME)
-    {
-        console_output(debugFlag, "k_spawn(): Process arguments too long. Halting.\n");
-        stop(1);
-    }
-
-    /* Validate stack size */
-    if (stacksize < THREADS_MIN_STACK_SIZE)
-    {
-        enableInterrupts();
-        return -2;
-    }
-
-    /* Validate priority */
-    if (priority < LOWEST_PRIORITY || priority > HIGHEST_PRIORITY)
-    {
-        enableInterrupts();
-        return -3;
-    }
-
-    /* Find an empty process table slot */
-    proc_slot = findEmptyProcessSlot();
-    if (proc_slot < 0)
-    {
-        enableInterrupts();
-        return -4;  /* Process table full */
-    }
-
-    /* Initialize the new process */
-    pNewProc = &processTable[proc_slot];
-    pNewProc->pid = nextPid++;
-    pNewProc->status = READY;
-    pNewProc->priority = priority;
-    pNewProc->entryPoint = entryPoint;
-    pNewProc->stacksize = stacksize;
-    pNewProc->exitCode = 0;
-    pNewProc->signaled = 0;
-    pNewProc->numChildren = 0;
-    pNewProc->startTime = system_clock() * 1000;  /* Convert ms to microseconds */
-    pNewProc->cpuTime = 0;
-    pNewProc->lastDispatchTime = 0;
-    pNewProc->nextSiblingProcess = NULL;
-
-    strcpy(pNewProc->name, name);
-    if (arg != NULL)
-        strcpy(pNewProc->startArgs, (char*)arg);
-    else
-        pNewProc->startArgs[0] = '\0';
-
-    /* Set parent process if one exists */
-    pParent = runningProcess;
-    pNewProc->pParent = pParent;
-    pNewProc->pChildren = NULL;
-
-    if (pParent != NULL)
-    {
-        /* Add to parent's children list */
-        pNewProc->nextSiblingProcess = pParent->pChildren;
-        pParent->pChildren = pNewProc;
-        pParent->numChildren++;
-    }
-    else
-    {
-        /* Watchdog and SchedulerEntryPoint have no parent */
-        pNewProc->pParent = NULL;
-    }
-
-    /* Initialize the process context */
-    pNewProc->context = context_initialize(launch, stacksize, arg);
-
-    /* Add to ready queue */
-    addToReadyQueue(pNewProc);
-
-    enableInterrupts();
-
-    DebugConsole("k_spawn(): created process %s with pid %d\n", name, pNewProc->pid);
-
-    return pNewProc->pid;
-}
-
-/*
- * launch()
- * 
- * Utility function called when a process first starts.
- * Enables interrupts and calls the process entry point.
- */
-static int launch(void *args)
-{
-    int exitCode;
-
-    DebugConsole("launch(): started: %s\n", runningProcess->name);
-
-    /* Enable interrupts for the new process */
-    enableInterrupts();
-
-    /* Call the entry point function */
-    exitCode = runningProcess->entryPoint(args);
-
-    /* If entry point returns, exit the process */
-    k_exit(exitCode);
-
-    return 0;  /* Should never reach here */
-}
-
-/*
- * time_slice()
- * 
- * Checks if the currently running process has exceeded its time slice quantum.
- * If so, calls the dispatcher to switch to the next process.
- */
-void time_slice()
-{
-    uint32_t currentTime;
-
-    if (runningProcess == NULL)
-        return;
-
-    currentTime = system_clock();
-
-    /* Check if quantum (80ms) has been exceeded */
-    if ((currentTime - runningProcess->lastDispatchTime) >= TIME_SLICE_QUANTUM)
-    {
-        dispatcher();
-    }
-}
-
-/*
- * dispatcher()
- * 
- * This is the kernel's process scheduler.
- * It selects the next process to run from the ready queue
- * and performs a context switch if necessary.
- */
-void dispatcher()
-{
-    Process *nextProcess;
-    uint32_t currentTime;
-
-    disableInterrupts();
-
-    /* Add current process back to ready queue if it's still running */
-    if (runningProcess != NULL && runningProcess->status == RUNNING)
-    {
-        runningProcess->status = READY;
-        addToReadyQueue(runningProcess);
-        DebugConsole("dispatcher(): added %s (pid %d) back to ready queue\n", 
-                    runningProcess->name, runningProcess->pid);
-    }
-
-    /* Get the next process from the ready queue */
-    if (readyQueueHead == NULL)
-    {
-        /* No process ready - this is a fatal error, should never happen */
-        console_output(debugFlag, "dispatcher(): ERROR - ready queue is empty! Halting.\n");
-        enableInterrupts();
-        stop(1);
-        return;
-    }
-
-    nextProcess = readyQueueHead;
-    removeFromReadyQueue(nextProcess);
-
-    /* Verify we have a valid process */
-    if (nextProcess == NULL)
-    {
-        console_output(debugFlag, "dispatcher(): ERROR - nextProcess is NULL! Halting.\n");
-        enableInterrupts();
-        stop(1);
-        return;
-    }
-
-    /* Update the running process and status */
-    runningProcess = nextProcess;
-    nextProcess->status = RUNNING;
-    currentTime = system_clock();
-    nextProcess->lastDispatchTime = currentTime;
-
-    DebugConsole("dispatcher(): switching to process %s (pid %d), current time: %u\n", 
-                nextProcess->name, nextProcess->pid, currentTime);
-
-    /* Enable interrupts before context switch */
-    enableInterrupts();
-
-    /* Perform the context switch - this should NOT return unless interrupted */
-    context_switch(nextProcess->context);
-}
-
-/*
- * k_getpid()
- * 
- * Returns the PID of the currently running process.
- */
-int k_getpid()
-{
-    if (runningProcess == NULL)
-        return -1;
-    return runningProcess->pid;
-}
-
-/*
- * signaled()
- * 
- * Checks if the currently running process has been signaled.
- */
-int signaled()
-{
-    if (runningProcess == NULL)
-        return 0;
-    return runningProcess->signaled;
-}
-
-/*
- * k_kill()
- * 
- * Sends a signal to the specified process.
- * The only supported signal is SIG_TERM.
- */
-int k_kill(int pid, int signal)
-{
-    Process *targetProcess;
-
-    disableInterrupts();
-
-    /* Validate signal */
-    if (signal != SIG_TERM)
-    {
-        console_output(debugFlag, "k_kill(): Invalid signal %d. Halting.\n", signal);
-        stop(1);
-    }
-
-    /* Find the target process */
-    targetProcess = getProcessByPid(pid);
-    if (targetProcess == NULL)
-    {
-        console_output(debugFlag, "k_kill(): Invalid process ID %d. Halting.\n", pid);
-        stop(1);
-    }
-
-    /* Mark process as signaled */
-    targetProcess->signaled = 1;
-
-    enableInterrupts();
-
-    return 0;
-}
-
-/*
- * k_exit()
- * 
- * Terminates the currently running process.
- * Does not return.
- */
-void k_exit(int exitCode)
-{
-    Process *parent;
-    Process *child;
-
-    disableInterrupts();
-
-    if (runningProcess == NULL)
-    {
-        enableInterrupts();
-        return;
-    }
-
-    /* Check for active children */
-    if (runningProcess->numChildren > 0)
-    {
-        console_output(debugFlag, "k_exit(): Process %s has %d active children. Halting.\n", 
-                      runningProcess->name, runningProcess->numChildren);
-        stop(1);
-    }
-
-    /* Override exit code if process was signaled */
-    if (runningProcess->signaled)
-        exitCode = -5;
-
-    /* Mark process as quit and save exit code */
-    runningProcess->exitCode = exitCode;
-    runningProcess->status = QUIT;
-
-    /* Notify parent if one exists */
-    parent = runningProcess->pParent;
-    if (parent != NULL)
-    {
-        parent->numChildren--;
-        
-        /* If parent is blocked waiting for children, unblock it */
-        if (parent->status == WAIT_BLOCK)
-        {
-            DebugConsole("k_exit(): unblocking parent process %s (pid %d)\n",
-                        parent->name, parent->pid);
-            parent->status = READY;
-            addToReadyQueue(parent);
         }
     }
-
-    DebugConsole("k_exit(): process %s (pid %d) exiting with code %d\n", 
-                runningProcess->name, runningProcess->pid, exitCode);
-
-    runningProcess = NULL;
-
-    enableInterrupts();
-
-    /* Dispatch to next process - does not return */
-    dispatcher();
-}
-
-/*
- * k_wait()
- * 
- * Waits for any child process to exit.
- * Returns the PID of the child that exited, or an error code.
- * If no child has exited but active children exist, blocks the process and dispatcher 
- * allows other processes to run. When a child exits, the parent is unblocked and loops
- * back to collect the exit code.
- */
-int k_wait(int* pChildExitCode)
-{
-    Process *child;
-    int childPid = -1;
-    int hasActiveChildren;
-
-    if (pChildExitCode == NULL)
-        return -1;
-
-    while (1)
-    {
-        disableInterrupts();
-
-        if (runningProcess == NULL)
-        {
-            enableInterrupts();
-            return -1;
-        }
-
-        /* Check if signaled while waiting */
-        if (runningProcess->signaled)
-        {
-            enableInterrupts();
-            return -5;
-        }
-
-        /* Look for a child that has already exited */
-        child = runningProcess->pChildren;
-        while (child != NULL)
-        {
-            if (child->status == QUIT)
-            {
-                childPid = child->pid;
-                *pChildExitCode = child->exitCode;
-                
-                /* Remove child from parent's list */
-                if (child == runningProcess->pChildren)
-                    runningProcess->pChildren = child->nextSiblingProcess;
-                else
-                {
-                    Process *temp = runningProcess->pChildren;
-                    while (temp != NULL && temp->nextSiblingProcess != child)
-                        temp = temp->nextSiblingProcess;
-                    if (temp != NULL)
-                        temp->nextSiblingProcess = child->nextSiblingProcess;
-                }
-                
-                /* Clean up the exited process */
-                child->status = EMPTY;
-                child->pid = -1;
-                
-                enableInterrupts();
-                return childPid;
-            }
-            child = child->nextSiblingProcess;
-        }
-
-        /* Check if there are any active (non-exited) children */
-        hasActiveChildren = 0;
-        child = runningProcess->pChildren;
-        while (child != NULL)
-        {
-            if (child->status != QUIT && child->status != EMPTY)
-            {
-                hasActiveChildren = 1;
-                break;
-            }
-            child = child->nextSiblingProcess;
-        }
-
-        /* If there are active children, block the process and dispatch to another */
-        if (hasActiveChildren)
-        {
-            DebugConsole("k_wait(): process %s (pid %d) blocked waiting for children\n",
-                        runningProcess->name, runningProcess->pid);
-            runningProcess->status = WAIT_BLOCK;
-            enableInterrupts();
-            dispatcher();
-            /* When resumed here (after a child exits and unblocks us), loop back to check for exited children */
-        }
-        else
-        {
-            /* If no active children and no exited children, return error */
-            enableInterrupts();
-            return -1;
-        }
-    }
-}
-
-/*
- * k_join()
- * 
- * Waits for a specific process to terminate.
- */
-int k_join(int pid, int* pChildExitCode)
-{
-    Process *targetProcess;
-
-    if (pChildExitCode == NULL)
-        return -1;
-
-    disableInterrupts();
-
-    if (runningProcess == NULL)
-    {
-        enableInterrupts();
-        return -1;
-    }
-
-    /* Cannot join with self */
-    if (pid == runningProcess->pid)
-    {
-        console_output(debugFlag, "k_join(): Cannot join with self. Halting.\n");
-        stop(1);
-    }
-
-    /* Find the target process */
-    targetProcess = getProcessByPid(pid);
-    if (targetProcess == NULL)
-    {
-        console_output(debugFlag, "k_join(): Invalid process ID %d. Halting.\n", pid);
-        stop(1);
-    }
-
-    /* Cannot join with parent */
-    if (targetProcess == runningProcess->pParent)
-    {
-        console_output(debugFlag, "k_join(): Cannot join with parent process. Halting.\n");
-        stop(2);
-    }
-
-    /* Wait for the process to exit */
-    while (targetProcess->status != QUIT)
-    {
-        /* Block and let other processes run */
-        enableInterrupts();
-        disableInterrupts();
-
-        /* Check if signaled while waiting */
-        if (runningProcess->signaled)
-        {
-            enableInterrupts();
-            return -5;
-        }
-
-        targetProcess = getProcessByPid(pid);
-        if (targetProcess == NULL)
-        {
-            enableInterrupts();
-            return 0;  /* Process already cleaned up */
-        }
-    }
-
-    *pChildExitCode = targetProcess->exitCode;
-
-    enableInterrupts();
-
-    return 0;
-}
-
-/*
- * block()
- * 
- * Blocks the currently running process with the given status.
- */
-int block(int blockStatus)
-{
-    disableInterrupts();
-
-    if (blockStatus <= 10)
-    {
-        console_output(debugFlag, "block(): Invalid block status %d. Halting.\n", blockStatus);
-        stop(1);
-    }
-
-    if (runningProcess == NULL)
-    {
-        enableInterrupts();
-        return -1;
-    }
-
-    /* Check if signaled */
-    if (runningProcess->signaled)
-    {
-        enableInterrupts();
-        return -5;
-    }
-
-    /* Change status and dispatch to next process */
-    runningProcess->status = blockStatus;
-
-    DebugConsole("block(): process %s (pid %d) blocked with status %d\n",
-                runningProcess->name, runningProcess->pid, blockStatus);
-
-    enableInterrupts();
-    dispatcher();
-
-    return 0;
-}
-
-/*
- * unblock()
- * 
- * Unblocks a previously blocked process.
- */
-int unblock(int pid)
-{
-    Process *targetProcess;
-
-    disableInterrupts();
-
-    targetProcess = getProcessByPid(pid);
-    if (targetProcess == NULL || targetProcess->status <= 10)
-    {
-        enableInterrupts();
-        return -1;
-    }
-
-    /* Return process to ready state */
-    DebugConsole("unblock(): unblocking process %s (pid %d) from status %d\n",
-                targetProcess->name, targetProcess->pid, targetProcess->status);
-    targetProcess->status = READY;
-    addToReadyQueue(targetProcess);
-
-    enableInterrupts();
-
-    return 0;
-}
-
-/*
- * read_time()
- * 
- * Returns the CPU time (in milliseconds) for the currently running process.
- */
-int read_time()
-{
-    if (runningProcess == NULL)
-        return 0;
-    return runningProcess->cpuTime;
-}
-
-/*
- * get_start_time()
- * 
- * Returns the start time (in microseconds) of the currently running process.
- */
-int get_start_time()
-{
-    if (runningProcess == NULL)
-        return 0;
-    return runningProcess->startTime;
-}
-
-/*
- * read_clock()
- * 
- * Returns the current system clock value.
- */
-DWORD read_clock()
-{
-    return system_clock();
-}
-
-/*
- * display_process_table()
- * 
- * Displays all non-empty processes in the process table.
- */
-void display_process_table()
-{
-    int i;
-    char statusStr[32];
-
-    console_output(debugFlag, "%-5s %-7s %-10s %-12s %-6s %-8s %s\n",
-                  "PID", "Parent", "Priority", "Status", "# Kids", "CPUtime", "Name");
-
-    for (i = 0; i < MAX_PROCESSES; i++)
-    {
-        if (processTable[i].status != EMPTY)
-        {
-            /* Convert status to string */
-            switch (processTable[i].status)
-            {
-                case READY:     strcpy(statusStr, "READY"); break;
-                case RUNNING:   strcpy(statusStr, "RUNNING"); break;
-                case WAIT_BLOCK: strcpy(statusStr, "WAIT_BLOCK"); break;
-                case QUIT:      strcpy(statusStr, "QUIT"); break;
-                default:        sprintf(statusStr, "%d", processTable[i].status);
-            }
-
-            console_output(debugFlag, "%-5d %-7d %-10d %-12s %-6d %-8d %s\n",
-                          processTable[i].pid,
-                          processTable[i].pParent ? processTable[i].pParent->pid : -1,
-                          processTable[i].priority,
-                          statusStr,
-                          processTable[i].numChildren,
-                          processTable[i].cpuTime,
-                          processTable[i].name);
-        }
-    }
-}
-
-/*
- * watchdog()
- * 
- * The watchdog process runs at the lowest priority.
- * It ensures the kernel terminates cleanly when all other processes are done.
- */
-static int watchdog(char* dummy)
-{
-    DebugConsole("watchdog(): started\n");
-
-    while (1)
-    {
-        check_deadlock();
-    }
-
-    return 0;
-}
-
-/*
- * check_deadlock()
- * 
- * Checks if the system has deadlocked or should terminate.
- * Accounts for processes that may be blocked in WAIT_BLOCK status (waiting for children).
- */
-static void check_deadlock()
-{
-    int i;
-    int activeProcesses = 0;
-
-    /* Count processes that are not empty and not watchdog or SchedulerEntryPoint */
-    for (i = 0; i < MAX_PROCESSES; i++)
-    {
-        if (processTable[i].status != EMPTY && processTable[i].status != QUIT)
-        {
-            if (i != 0)  /* Skip watchdog (usually at index 0) */
-            {
-                activeProcesses++;
-            }
-        }
-    }
-
-    /* If only watchdog is left, shut down gracefully */
-    if (activeProcesses == 1)
-    {
-        console_output(debugFlag, "watchdog(): No remaining processes. Shutting down.\n");
-        stop(0);
-    }
-
-    /* Check for deadlock: watchdog running but other processes exist and none ready */
-    if (activeProcesses > 1)
-    {
-        int readyProcesses = 0;
-        int runningProcesses = 0;
-
-        for (i = 0; i < MAX_PROCESSES; i++)
-        {
-            if (processTable[i].status == READY)
-                readyProcesses++;
-            if (processTable[i].status == RUNNING)
-                runningProcesses++;
-        }
-
-        /* Deadlock only if processes exist but none are ready or running (not blocked) */
-        if (readyProcesses == 0 && runningProcesses == 0)
-        {
-            console_output(debugFlag, "watchdog(): Deadlock detected! Halting.\n");
-            stop(1);
-        }
-    }
-}
-
-/*
- * DebugConsole()
- * 
- * Outputs debug messages if debug flag is enabled.
- */
-static void DebugConsole(char* format, ...)
-{
-    char buffer[2048];
-    va_list argptr;
-
-    if (debugFlag)
-    {
-        va_start(argptr, format);
-        vsprintf(buffer, format, argptr);
-        console_output(TRUE, buffer);
-        va_end(argptr);
-    }
-}
-
-/*
- * check_io_scheduler()
- * 
- * Placeholder for I/O checking in the scheduler.
- * Currently returns 0 since there is no I/O in this iteration.
- */
-int check_io_scheduler()
-{
-    return 0;
+    return NULL; // no process with the specified pid found
 }
