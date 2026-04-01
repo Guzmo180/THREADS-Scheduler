@@ -1,14 +1,15 @@
 #define _CRT_SECURE_NO_WARNINGS
 #define NUM_PRIORITIES 6
-#define MAX_PID 51
+#define MAXPROC 51
 #include <stdio.h>
 #include "THREADSLib.h"
 #include "Scheduler.h"
 #include "Processes.h"
 
+void readyq_push(Process* proc);  //fixed the 2371 error
 Process* readyq_pop_highest(void);
 Process* readyProcs[NUM_PRIORITIES];
-Process processTable[MAX_PROCESSES];
+Process processTable[MAXPROC];
 Process* runningProcess = NULL;
 int nextPid = 1;
 int debugFlag = 1;
@@ -21,6 +22,7 @@ void dispatcher();
 static int launch(void*);
 static void check_deadlock();
 static void DebugConsole(char* format, ...);
+
 
 /* DO NOT REMOVE */
 extern int SchedulerEntryPoint(void* pArgs);
@@ -59,17 +61,25 @@ int bootstrap(void* pArgs)
 
     /* Initialize the process table. */
     runningProcess = NULL;
-    for (int i = 0; i < MAX_PROCESSES; i++)
+    for (int i = 0; i < MAXPROC; i++)
     {
+        processTable[i].status = STATUS_EMPTY;
         processTable[i].pid = 0; // mark process table entry as empty
     }
-    
+
     /* Initialize the Ready list, etc. */
-    readyProcs[0] = NULL;
+    for (int i = 0; i < NUM_PRIORITIES; i++)
+    {
+        readyProcs[i] = NULL;
+    }
+    //readyProcs[0] = NULL;
+
     /* Initialize the clock interrupt handler */
     interrupt_handler_t* handlers;
     handlers = get_interrupt_handlers();
     //handlers[THREADS_TIMER_INTERRUPT] = time_slice;
+
+
     /* startup a watchdog process */
     result = k_spawn("watchdog", watchdog, NULL, THREADS_MIN_STACK_SIZE, LOWEST_PRIORITY);
     if (result < 0)
@@ -87,7 +97,8 @@ int bootstrap(void* pArgs)
     }
     enable_interrupts();
     dispatcher();
-    printf("%c is result", result);
+    //printf("%c is result", result);
+
     /* Initialized and ready to go!! */
 
     /* This should never return since we are not a real process. */
@@ -115,7 +126,7 @@ int bootstrap(void* pArgs)
 ************************************************************************ */
 int k_spawn(char* name, int (*entryPoint)(void*), void* arg, int stacksize, int priority)
 {
-    int proc_slot;
+    int proc_slot = -1;
     struct _process* pNewProc;
 
     DebugConsole("spawn(): creating process %s\n", name);
@@ -162,19 +173,18 @@ int k_spawn(char* name, int (*entryPoint)(void*), void* arg, int stacksize, int 
     }
     /* Find an empty slot in the process table */
 
-    proc_slot = -1;  // just use 1 for now! needs to be -1
-    int checkedSlots = 0;
-    int procSlotIndex = 0;
-    while (checkedSlots < MAXPROC)
+    //proc_slot = -1;  // just use 1 for now! needs to be -1
+
+    //int checkedSlots = 0;
+    //int procSlotIndex = 0;
+    for (int i = 0; i < MAXPROC; i++)
     {
-        if (processTable[procSlotIndex].status == STATUS_READY )
+        if (processTable[i].status == STATUS_EMPTY)
         {
-            proc_slot = procSlotIndex;
-            break;
+            proc_slot = i;
+            break;  //so it stops looking
         }
-        procSlotIndex = (procSlotIndex + 1) % MAXPROC;
-        checkedSlots++;
-    }
+   }
     if (proc_slot == -1)
     {
         console_output(debugFlag, "spawn(): no process slots free. \n");
@@ -184,13 +194,24 @@ int k_spawn(char* name, int (*entryPoint)(void*), void* arg, int stacksize, int 
 
     /* Setup the entry in the process table. */
     strcpy(pNewProc->name, name);
+    pNewProc->pid = nextPid++;
+    pNewProc->status = STATUS_READY;
+    pNewProc->priority = clamp_priority(priority);
+    pNewProc->entryPoint = entryPoint;
 
     /* If there is a parent process,add this to the list of children. */
     if (runningProcess != NULL)
     {
+        pNewProc->pParent = runningProcess;
+    }
+    //next sib and pchild logic maybe here
+    else
+    {
+        pNewProc->pParent = NULL;
     }
 
     /* Add the process to the ready list. */
+    readyq_push(pNewProc);
 
     /* Initialize context for this process, but use launch function pointer for
      * the initial value of the process's program counter (PC)
@@ -221,12 +242,12 @@ static int launch(void* args)
     enable_interrupts();
 
     //call the function passed to k_spawn
-    runningProcess->entryPoint(args);
+    int result = runningProcess->entryPoint(args);
     /* Call the function passed to spawn and capture its return value */
     DebugConsole("Process %d returned to launch\n", runningProcess->pid);
 
     /* Stop the process gracefully */
-    k_exit(0);
+    k_exit(result);
     return 0;
 }
 
@@ -245,8 +266,10 @@ static int launch(void* args)
 ************************************************************************ */
 int k_wait(int* code)
 {
-    int result = 0;
-    return result;
+    disableInterrupts();
+    runningProcess->status = STATUS_BLOCKED;
+    dispatcher();
+    return 0;
 
 }
 
@@ -263,7 +286,17 @@ int k_wait(int* code)
 *************************************************************************/
 void k_exit(int code)
 {
-
+    disableInterrupts();
+    runningProcess->status = STATUS_QUIT;
+    if (runningProcess->pParent != NULL)
+    {
+        if (runningProcess->pParent->status == STATUS_BLOCKED)
+        {
+            runningProcess->pParent->status = STATUS_READY;
+            readyq_push(runningProcess->pParent);
+        }
+    }
+    dispatcher();
 
 }
 
@@ -355,20 +388,28 @@ void display_process_table()
 void dispatcher()
 {
     Process* nextProcess = NULL;
-    
+
     //get the next ready process
-    clamp_priority(runningProcess->priority);
+    if (runningProcess != NULL)
+    {
+        // clamp_priority(runningProcess->priority);  //try this in kspawn
+    }
+
+       
     nextProcess = readyq_pop_highest();
-    if (nextProcess == NULL) {
+    if (nextProcess == NULL) 
+    {
         console_output(debugFlag, "dispatcher(): No ready process found!  Stopping...\n");
         stop(3);
     }
-    DebugConsole("dispatcher(): switching to process %s (pid %d)\n", nextProcess->name, nextProcess->pid);
+    
     runningProcess = nextProcess;
+    runningProcess->status = STATUS_RUNNING;
+    DebugConsole("dispatcher(): switching to process %s (pid %d)\n", runningProcess->name, runningProcess->pid);
 
     // check the runningproccess time_slice
-    time_slice();
-    context_switch(nextProcess->context);
+    //time_slice();
+    context_switch(runningProcess->context);
 
 }
 
@@ -410,17 +451,12 @@ static void check_deadlock()
  */
 static inline void disableInterrupts()
 {
-
     /* We ARE in kernel mode */
-
-
     int psr = get_psr();
-
     psr = psr & ~PSR_INTERRUPTS;
-
     set_psr(psr);
-
-} /* disableInterrupts */
+} 
+/* disableInterrupts */
 static inline void enable_interrupts()
 {
     int psr = get_psr();
@@ -439,13 +475,13 @@ static inline void enable_interrupts()
 *************************************************************************/
 static void DebugConsole(char* format, ...)
 {
-    char buffer[2048];
+    char buffer[128];
     va_list argptr;
 
     if (debugFlag)
     {
         va_start(argptr, format);
-        vsprintf(buffer, format, argptr);
+        vsnprintf(buffer, sizeof(buffer), format, argptr);
         console_output(TRUE, buffer);
         va_end(argptr);
 
@@ -476,7 +512,7 @@ static int clamp_priority(int priority)
 
 }
 
-void readyq_push(Process* proc)
+void readyq_push(Process* proc)  
 {
     if (proc == NULL) return;
     int prio = clamp_priority(proc->priority);
@@ -517,7 +553,7 @@ Process* readyq_pop_highest(void) // Pop the highest priority process
 
 Process* readyq_remove_pid(int pid)
 {
-    Process* target = &processTable[pid % MAX_PROCESSES];
+    Process* target = &processTable[pid % MAXPROC];
     int prio = clamp_priority(target->priority);
     Process* prev = NULL;
     Process* cur = readyProcs[prio];
@@ -546,22 +582,5 @@ Process* readyq_remove_pid(int pid)
 
 void time_slice(void)
 {
-    disableInterrupts();
-    if (runningProcess != NULL)
-    {
-        readyq_push(runningProcess);
-    }
-    Process* nextProcess = readyq_pop_highest();
-    if (nextProcess == NULL)
-    {
-        nextProcess = runningProcess;
-    }
 
-    runningProcess = nextProcess;
-
-    if (runningProcess != NULL)
-    {
-        context_switch(runningProcess->context);
-    }
-    
 }
